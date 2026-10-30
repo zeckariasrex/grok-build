@@ -203,6 +203,13 @@ fn protected_table_is_pinned() {
     ] {
         expected.push(path(own_session.join(name)));
     }
+    // the same names at any depth below the workspace, not the workspace's own copies
+    for name in WORKSPACE_PROTECTED_SUBPATHS {
+        expected.push(Protected::AnyDepth {
+            root: ws.to_path_buf(),
+            name: (*name).to_owned(),
+        });
+    }
     expected.sort();
     assert_eq!(expected, got);
 }
@@ -899,6 +906,190 @@ fn a_root_at_or_beneath_a_globs_literal_prefix_is_carved_and_ungrantable() {
     let beside = ws.join("src");
     assert!(!hooks.reaches_into(&beside));
     assert!(!is_ungrantable(&beside, &floor));
+}
+
+/// A package's editor and agent config directories are protected at any depth under the served
+/// workspace, including when that workspace is a worktree. The package itself stays grantable;
+/// the deny is the named directory, carved out of a grant of its parent.
+#[test]
+fn nested_package_config_dirs_are_protected_and_their_parents_stay_grantable() {
+    let ws = Path::new("/opt/ws-fixture/ws");
+    let home = Path::new("/opt/ws-fixture/u");
+    let got = floor(&inputs(&ServedRoot::pin(ws), &home.join(".grok"), home));
+    for inside in [
+        "packages/app/.claude/settings.json",
+        "packages/app/.grok/hooks/pre.sh",
+        "packages/app/.cursor/hooks.json",
+        "packages/app/.vscode/settings.json",
+        "packages/app/.idea/workspace.xml",
+        "pkg/.claude/settings.local.json",
+        "a/b/c/.grok/skills/x/SKILL.md",
+        "packages/app/.claude",
+    ] {
+        assert!(is_protected(&ws.join(inside), &got), "{inside}");
+    }
+    for open in [
+        "packages/app/src/main.rs",
+        "packages/app/.claudeignore",
+        "src/main.rs",
+        ".gitignore",
+    ] {
+        assert!(!is_protected(&ws.join(open), &got), "{open}");
+    }
+    for grantable in [
+        ws.to_path_buf(),
+        ws.join("packages"),
+        ws.join("packages/app"),
+        ws.join("src"),
+    ] {
+        assert!(!is_ungrantable(&grantable, &got), "{grantable:?}");
+    }
+    assert!(got.iter().any(|entry| {
+        matches!(entry, Protected::AnyDepth { .. }) && entry.reaches_into(&ws.join("packages/app"))
+    }));
+    assert!(is_protected(&ws.join(".claude/settings.json"), &got));
+    assert!(is_ungrantable(&ws.join(".claude"), &got));
+    assert!(is_ungrantable(&ws.join("packages/app/.claude"), &got));
+    assert!(!is_ungrantable(
+        &ws.join("packages/app/.claudeignore"),
+        &got
+    ));
+
+    let wt = Path::new("/opt/ws-fixture/wt");
+    let served = floor(&inputs(&ServedRoot::pin(wt), &home.join(".grok"), home));
+    assert!(is_protected(
+        &wt.join("packages/app/.claude/settings.json"),
+        &served
+    ));
+    assert!(!is_protected(&wt.join("packages/app/src/lib.rs"), &served));
+    assert!(!is_ungrantable(&wt.join("packages/app"), &served));
+    assert!(!is_protected(
+        &ws.join("packages/app/.claude/settings.json"),
+        &served
+    ));
+}
+
+/// Config directories on the folders above the workspace are protected through the repository
+/// root git finds, and nowhere above it. A workspace that is itself a repository root, or that
+/// is not in a repository, does not take its parents'.
+#[test]
+fn ancestor_config_dirs_up_to_the_git_root_are_protected() {
+    let root = scratch("ancestor-floor");
+    let repo = root.join("repo");
+    let packages = repo.join("packages");
+    let app = packages.join("app");
+    let home = root.join("home");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(home.join(".grok")).unwrap();
+    let got = floor(&inputs(&ServedRoot::pin(&app), &home.join(".grok"), &home));
+    for dir in [&packages, &repo] {
+        for name in WORKSPACE_PROTECTED_SUBPATHS {
+            let config = dir.join(name);
+            assert!(
+                is_protected(&config.join("settings.json"), &got),
+                "{config:?}"
+            );
+            assert!(is_ungrantable(&config, &got), "{config:?}");
+            assert!(!is_ungrantable(dir, &got), "{dir:?}");
+        }
+    }
+    assert!(!is_protected(&root.join(".claude/settings.json"), &got));
+    assert!(!is_protected(
+        &repo.join("packages/other/.claude/settings.json"),
+        &got
+    ));
+    assert!(!is_ungrantable(&app, &got));
+    assert!(is_protected(&app.join(".claude/settings.json"), &got));
+
+    let inner = repo.join("vendor/lib");
+    std::fs::create_dir_all(inner.join(".git")).unwrap();
+    let got = floor(&inputs(
+        &ServedRoot::pin(&inner),
+        &home.join(".grok"),
+        &home,
+    ));
+    assert!(is_protected(&inner.join(".cursor/hooks.json"), &got));
+    assert!(!is_protected(&repo.join(".claude/settings.json"), &got));
+    assert!(!is_protected(&repo.join("vendor/.grok/hooks/pre.sh"), &got));
+
+    let wt = repo.join("feature");
+    std::fs::create_dir_all(wt.join("pkg")).unwrap();
+    std::fs::write(wt.join(".git"), "gitdir: ../.git/worktrees/feature\n").unwrap();
+    let got = floor(&inputs(
+        &ServedRoot::pin(&wt.join("pkg")),
+        &home.join(".grok"),
+        &home,
+    ));
+    assert!(is_protected(&wt.join(".idea/workspace.xml"), &got));
+    assert!(is_protected(&wt.join("pkg/.vscode/settings.json"), &got));
+    assert!(!is_protected(&repo.join(".claude/settings.json"), &got));
+
+    // No parents exist to walk, so this is the same answer as a tree with no repository.
+    let absent = Path::new("/opt/ws-fixture/not-a-repo/pkg");
+    let got = floor(&inputs(
+        &ServedRoot::pin(absent),
+        &home.join(".grok"),
+        &home,
+    ));
+    assert!(is_protected(&absent.join(".grok/hooks/pre.sh"), &got));
+    assert!(!is_protected(
+        &Path::new("/opt/ws-fixture/not-a-repo/.claude/settings.json"),
+        &got
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A hook config symlink at the workspace, or on a parent up to the git root, protects the
+/// file it names. The directory that holds the target stays grantable. Skipped where the host
+/// cannot create a symlink.
+#[test]
+fn a_hook_config_symlink_protects_its_target() {
+    let root = scratch("hook-symlink");
+    let repo = root.join("repo");
+    let app = repo.join("pkg");
+    let home = root.join("home");
+    let dotfiles = root.join("dotfiles");
+    std::fs::create_dir_all(app.join(".claude")).unwrap();
+    std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+    std::fs::create_dir_all(app.join(".grok/hooks")).unwrap();
+    std::fs::create_dir_all(home.join(".grok")).unwrap();
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let claude = dotfiles.join("claude.json");
+    let hooks_json = dotfiles.join("hooks.json");
+    let pre = dotfiles.join("pre.sh");
+    let other = dotfiles.join("other.json");
+    for file in [&claude, &hooks_json, &pre, &other] {
+        std::fs::write(file, "{}\n").unwrap();
+    }
+    if symlink_file(&claude, &app.join(".claude/settings.json")).is_err()
+        || symlink_file(&hooks_json, &repo.join(".cursor/hooks.json")).is_err()
+        || symlink_file(&pre, &app.join(".grok/hooks/pre.sh")).is_err()
+    {
+        eprintln!("skipped: this host cannot create a symlink");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    let got = floor(&inputs(&ServedRoot::pin(&app), &home.join(".grok"), &home));
+    assert!(is_protected(&claude, &got));
+    assert!(is_protected(&hooks_json, &got));
+    assert!(is_protected(&pre, &got));
+    assert!(!is_protected(&other, &got));
+    assert!(!is_ungrantable(&dotfiles, &got));
+    assert!(!is_ungrantable(&app, &got));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }
 
 /// The anchor a rename could swap out: a path or tree as is, a glob up to its first

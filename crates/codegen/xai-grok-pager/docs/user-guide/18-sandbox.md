@@ -173,6 +173,8 @@ The sandbox is applied to the **entire grok process** at startup using kernel pr
 - `bash` commands, `grep` (rg) -- child processes inherit FS restrictions automatically
 - Network -- on Linux, child processes can be blocked via seccomp; on macOS this is a no-op
 
+The workspace daemon also wraps each command. That wrapper write-denies `.grok`, `.cursor`, `.claude`, `.vscode`, and `.idea` at the workspace root, and the same directory names at any depth below it. A package such as `packages/app/.claude` is covered, including that package inside a worktree a subagent is serving. The same names are also denied on each existing folder above the workspace, up to and including the repository root. That root is the first parent with a `.git` file or directory. Above it, and when the workspace is not in a repository, only the workspace's own copies are protected. The parent folder stays writable and a grant of it is still offered; the deny is carved out of the allow. A hook config that is a symlink at the workspace, or on one of those parent folders, also write-denies the file or directory it points at (`.claude/settings.json`, `.claude/settings.local.json`, `.cursor/hooks.json`, and files in `.grok/hooks`). Nested package trees are not scanned for those links. On macOS, Seatbelt covers a matching directory created after the policy is built. The hard-link scan does not walk the workspace looking for these nested trees.
+
 When a non-`off` sandbox profile is **requested** (CLI, `GROK_SANDBOX`, config, or a managed requirement):
 
 - The agent runs **in-process**, not through the shared leader, so tool calls stay in this process when the profile is enforced. If leader mode would otherwise have been on, a one-line note at startup says so

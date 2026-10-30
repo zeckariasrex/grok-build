@@ -168,6 +168,8 @@ enum Pinned<'a> {
     TreeExcept { tree: &'a Path, except: &'a Path },
     /// The symlink itself ([`Protected::Node`]), never what it points to.
     Node(&'a Path),
+    /// [`Protected::AnyDepth`]: directory `name` at any depth strictly below `root`.
+    AnyDepth { root: &'a Path, name: &'a str },
 }
 
 impl<'a> TryFrom<&'a Protected> for Pinned<'a> {
@@ -186,6 +188,7 @@ impl<'a> TryFrom<&'a Protected> for Pinned<'a> {
             },
             Protected::TreeExcept { tree, except } => Pinned::TreeExcept { tree, except },
             Protected::Node { path } => Pinned::Node(path),
+            Protected::AnyDepth { root, name } => Pinned::AnyDepth { root, name },
         })
     }
 }
@@ -208,6 +211,7 @@ impl Pinned<'_> {
         match self {
             Pinned::Path(path) | Pinned::Node(path) => path.to_path_buf(),
             Pinned::TreeExcept { tree, .. } => tree.to_path_buf(),
+            Pinned::AnyDepth { root, .. } => root.to_path_buf(),
             Pinned::Glob { root, tail } => {
                 let prefix: PathBuf = Path::new(tail)
                     .components()
@@ -235,6 +239,7 @@ impl Pinned<'_> {
                 let prefix = self.anchor();
                 is_within(&prefix, root) || is_within(root, &prefix)
             }
+            Pinned::AnyDepth { root: base, .. } => is_within(root, base) || is_within(base, root),
         }
     }
 }
@@ -325,6 +330,12 @@ fn pinned_filters(
         }
         Pinned::Glob { root, tail } => {
             let mut filters = glob_filters(root, tail)?;
+            filters.extend(glob_filters(root, &format!("{tail}/**"))?);
+            Ok(filters)
+        }
+        Pinned::AnyDepth { root, name } => {
+            let tail = format!("**/*/{name}");
+            let mut filters = glob_filters(root, &tail)?;
             filters.extend(glob_filters(root, &format!("{tail}/**"))?);
             Ok(filters)
         }

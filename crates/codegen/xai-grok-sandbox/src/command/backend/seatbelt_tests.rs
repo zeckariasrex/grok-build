@@ -548,6 +548,38 @@ fn glob_and_tree_except_floor_entries_render_as_regex_and_require_all_filters() 
     );
 }
 
+/// A nested package config directory renders as anchored regexes that need one path segment
+/// between the workspace and the name, so the workspace's own `.claude` is not this entry.
+/// The package stays inside the write allow; the name is carved out of it.
+#[test]
+fn nested_package_config_dir_renders_as_a_regex_carved_out_of_the_write_root() {
+    let ws = Path::new("/opt/ws-fixture/ws");
+    let mut policy = fixture_policy();
+    policy.write_roots = vec![ws.to_path_buf()];
+    policy.read = ReadPolicy::AllExcept { deny: vec![] };
+    policy.protected = vec![Protected::AnyDepth {
+        root: ws.to_path_buf(),
+        name: ".claude".to_owned(),
+    }];
+    let sbpl = render_enforce(&policy, &tag()).expect("render");
+    let dir = "(regex #\"^/opt/ws-fixture/ws/(.*/)?[^/]*/\\.claude$\")";
+    let beneath = "(regex #\"^/opt/ws-fixture/ws/(.*/)?[^/]*/\\.claude/.*$\")";
+    let root =
+        "(require-any (literal (param \"WRITABLE_ROOT_0\")) (subpath (param \"WRITABLE_ROOT_0\")))";
+    for expected in [
+        format!(
+            "(allow file-write* (require-all {root} (require-not {dir}) (require-not {beneath})) (with message \"grok-t\"))"
+        ),
+        format!("(deny file-write* file-link {dir} {beneath} (with message \"grok-t\"))"),
+    ] {
+        assert!(
+            sbpl.profile.contains(&expected),
+            "missing:\n{expected}\nin:\n{}",
+            sbpl.profile
+        );
+    }
+}
+
 /// A read deny is pinned as a floor entry is, in every shape: carved out of the write root it
 /// reaches into, write- and link-denied, its glob prefix a node, its existing ancestors held
 /// against rename — and then read-denied last. Without the pins, `mv .env aside` followed by a
