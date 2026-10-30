@@ -2085,6 +2085,7 @@ fn policy_paths(policy: &SandboxPolicy) -> Vec<PathBuf> {
             Protected::Path { path } | Protected::Node { path } => paths.push(path.clone()),
             Protected::Glob { glob } => paths.push(PathBuf::from(glob)),
             Protected::TreeExcept { tree, except } => paths.extend([tree.clone(), except.clone()]),
+            Protected::AnyDepth { root, .. } => paths.push(root.clone()),
         }
     }
     paths

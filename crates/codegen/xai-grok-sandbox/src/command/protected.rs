@@ -12,6 +12,21 @@
 //! repository nested in the workspace (`git init sub`, a vendored clone) keeps a writable
 //! `.git/config` and `.git/hooks` that git later runs outside the sandbox; covering them would
 //! put every `git init` or `git clone` in a workspace behind a card.
+//!
+//! Nested package and editor config directories (the names in [`WORKSPACE_PROTECTED_SUBPATHS`])
+//! at any depth below the workspace are on the floor too, including a worktree subagent's copy
+//! of a package. The parent folder stays grantable; the deny is carved out of its allow. The
+//! hard-link walk does not search the workspace for those nested trees: a link of a file inside
+//! one, made from a writable path, is not detected. The kernel deny still covers the nested path.
+//!
+//! The same names on each existing folder above the workspace, up to and including the repository
+//! root, are floor paths too. The root is the first directory, walking parents of the pinned real
+//! path, that has a `.git` file or directory. The workspace's own `.git` makes it that root, so
+//! nothing above it is added. No `.git` on the way means the workspace is not in a repository and
+//! only its own copies are protected. A hook config that is a symlink in one of those concrete
+//! directories also names its target: `.claude/settings.json`, `.claude/settings.local.json`,
+//! `.cursor/hooks.json`, and entries of `.grok/hooks`. Nested package trees are not scanned
+//! for those links.
 
 #[cfg(unix)]
 use std::collections::{BTreeMap, VecDeque};
@@ -56,6 +71,12 @@ pub enum Protected {
     /// This symlink itself, never what it points to: it cannot be re-pointed, and a path through
     /// it is judged where it leads.
     Node { path: PathBuf },
+    /// A directory named `name` at any depth strictly below `root` (not `root/name` itself), and
+    /// everything beneath it, present or created later. `name` is one literal path segment. A
+    /// grant of `root` or of a folder under it stays offerable: the match is that one name, and
+    /// the renderer carves it out of the allow. The workspace's own `root/name` is a `Path`
+    /// entry, not this one.
+    AnyDepth { root: PathBuf, name: String },
 }
 
 impl Protected {
@@ -70,6 +91,7 @@ impl Protected {
             Protected::TreeExcept { tree, except } => {
                 is_within(path, tree) && !is_within(path, except)
             }
+            Protected::AnyDepth { root, name } => covers_nested_name(path, root, name),
         }
     }
 
@@ -86,6 +108,9 @@ impl Protected {
                 let prefix = self.anchor();
                 is_within(&prefix, root) || is_within(root, &prefix)
             }
+            Protected::AnyDepth { root: base, .. } => {
+                is_within(root, base) || is_within(base, root)
+            }
         }
     }
 
@@ -93,7 +118,10 @@ impl Protected {
     pub fn as_path(&self) -> Option<&Path> {
         match self {
             Protected::Path { path } => Some(path),
-            Protected::Glob { .. } | Protected::TreeExcept { .. } | Protected::Node { .. } => None,
+            Protected::Glob { .. }
+            | Protected::TreeExcept { .. }
+            | Protected::Node { .. }
+            | Protected::AnyDepth { .. } => None,
         }
     }
 
@@ -112,8 +140,35 @@ impl Protected {
                         .is_some_and(crate::deny::is_glob)
                 })
                 .collect(),
+            Protected::AnyDepth { root, .. } => root.clone(),
         }
     }
+}
+
+/// Whether `path` is a directory named `name` nested strictly below `root`, or lies beneath one.
+/// `root/name` itself is the workspace's own tree and is not this entry.
+fn covers_nested_name(path: &Path, root: &Path, name: &str) -> bool {
+    if !is_within(path, root) || is_same_path(path, root) {
+        return false;
+    }
+    for ancestor in path.ancestors() {
+        if is_same_path(ancestor, root) {
+            return false;
+        }
+        let Some(parent) = ancestor.parent() else {
+            continue;
+        };
+        if component_is(ancestor, name) && is_within(parent, root) && !is_same_path(parent, root) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `path`'s last component is `name`, folded the way the host's volumes compare names.
+fn component_is(path: &Path, name: &str) -> bool {
+    path.file_name()
+        .is_some_and(|got| is_same_path(Path::new(got), Path::new(name)))
 }
 
 /// A directory itself, not a symlink to one or a file in its place: the only kind of ancestor an
@@ -159,10 +214,23 @@ pub fn is_ungrantable(root: &Path, floor: &[Protected]) -> bool {
 }
 
 /// Subpaths of the workspace root that stay read-only even though the root is writable: the
-/// editors' and agents' own config trees. The git entries are derived from the repository's
-/// layout by [`git_config::git_entries_in`].
+/// editors' and agents' own config trees. The same names at any depth below the root are
+/// [`Protected::AnyDepth`] entries, so a package folder and a worktree subagent's copy of it
+/// are covered too. The same names on each folder from the parent up to the git root are
+/// [`Protected::Path`] entries ([`ancestor_config_roots`]). The git entries are derived from
+/// the repository's layout by [`git_config::git_entries_in`].
 pub const WORKSPACE_PROTECTED_SUBPATHS: &[&str] =
     &[".grok", ".cursor", ".claude", ".vscode", ".idea"];
+
+/// Hook configs, relative to a protected directory, whose symlink target is denied when the
+/// link exists. `.grok/hooks` itself is included so a link in its place denies the tree it
+/// names; its child links are collected separately.
+const HOOK_CONFIG_SYMLINKS: &[&str] = &[
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    ".cursor/hooks.json",
+    ".grok/hooks",
+];
 
 /// The entries of a git directory that run or reconfigure code on the user's next git action:
 /// `hooks/`, `config` and `config.worktree` (`core.hooksPath`, `core.fsmonitor`, filters; the
@@ -1014,6 +1082,75 @@ pub struct Floor {
     pub unread_git_metadata: Vec<GitMetadataUnread>,
 }
 
+/// Directories above `ws`, from its parent through the repository root, when git would find
+/// that root by walking up to a `.git` file or directory. Empty when `ws` itself is the root,
+/// or when no `.git` exists on the real parents. The walk stops at a missing parent, so a
+/// workspace spelled on a path that does not exist yet adds nothing.
+fn ancestor_config_roots(ws: &Path) -> Vec<PathBuf> {
+    if git_marker(ws) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut current = ws.to_path_buf();
+    loop {
+        let Some(parent) = current.parent() else {
+            return Vec::new();
+        };
+        if is_same_path(parent, &current) || !is_real_directory(parent) {
+            return Vec::new();
+        }
+        found.push(parent.to_path_buf());
+        if git_marker(parent) {
+            return found;
+        }
+        current = parent.to_path_buf();
+    }
+}
+
+/// Whether `dir` is a repository root git would stop at: it contains a `.git` entry, directory
+/// or file, including a symlink git would follow.
+fn git_marker(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(GIT_DIR_NAME)).is_ok()
+}
+
+/// Resolved targets of hook-config symlinks directly under `dir`. A regular file is already
+/// covered by the directory entry. A dangling link, or one that does not name a file or
+/// directory, adds nothing.
+fn hook_symlink_targets(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for rel in HOOK_CONFIG_SYMLINKS {
+        consider_symlink(&mut out, &dir.join(rel));
+    }
+    let hooks = dir.join(".grok/hooks");
+    if is_real_directory(&hooks) {
+        if let Ok(entries) = std::fs::read_dir(&hooks) {
+            for entry in entries.flatten() {
+                consider_symlink(&mut out, &entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// When `path` is a symlink to a file or directory, record that target in its canonical spelling.
+fn consider_symlink(out: &mut Vec<PathBuf>, path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.file_type().is_symlink() {
+        return;
+    }
+    let target = canonical_path(path);
+    match std::fs::metadata(&target) {
+        Ok(followed) if followed.is_file() || followed.is_dir() => {
+            if !is_same_path(&target, path) {
+                out.push(target);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The full floor for one workspace, canonical, sorted and deduplicated.
 pub fn floor(inputs: &ProtectedInputs<'_>) -> Vec<Protected> {
     floor_with_unread(inputs).protected
@@ -1031,6 +1168,25 @@ pub fn floor_with_unread(inputs: &ProtectedInputs<'_>) -> Floor {
         .iter()
         .map(|sub| path(ws.join(sub)))
         .collect();
+    out.extend(
+        WORKSPACE_PROTECTED_SUBPATHS
+            .iter()
+            .map(|name| Protected::AnyDepth {
+                root: ws.clone(),
+                name: (*name).to_owned(),
+            }),
+    );
+    let ancestors = ancestor_config_roots(&ws);
+    for dir in &ancestors {
+        out.extend(
+            WORKSPACE_PROTECTED_SUBPATHS
+                .iter()
+                .map(|name| path(dir.join(name))),
+        );
+    }
+    for dir in std::iter::once(&ws).chain(&ancestors) {
+        out.extend(hook_symlink_targets(dir).into_iter().map(&path));
+    }
     let tmp_dirs = default_tmp_dirs(None, inputs.user_home);
     let tmp_dirs: Vec<PathBuf> = tmp_dirs.iter().map(|dir| canonical_path(dir)).collect();
     let write_roots = default_write_roots(inputs, &tmp_dirs);
@@ -1254,9 +1410,12 @@ pub fn hard_linked_protected_file(
             Protected::Glob { glob } if within_a_root(&entry.anchor()) => {
                 linked.add_glob_matches(glob, &entry.anchor())
             }
-            Protected::Glob { .. } | Protected::TreeExcept { .. } | Protected::Node { .. } => {
-                Ok(())
-            }
+            // A workspace-wide walk to find these names hits the scan limit on an ordinary tree
+            // and would refuse every command. The kernel deny still covers the nested path.
+            Protected::AnyDepth { .. }
+            | Protected::Glob { .. }
+            | Protected::TreeExcept { .. }
+            | Protected::Node { .. } => Ok(()),
         };
         if let Err(tree) = listed {
             return Some(HardLinked {
